@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+node_modules/
+.next/
+tsconfig.tsbuildinfo
+.env
+*.env
+backend/.env
