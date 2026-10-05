@@ -29,6 +29,9 @@ from app.tools import generate_mindmap, generate_quiz
 # higher-reasoning sibling, if lower latency ever needs to be traded for it.
 GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 
+DEFAULT_VOICE = "Kore"
+SUPPORTED_VOICES = frozenset({"Kore", "Puck", "Charon", "Aoede"})
+
 TOOL_DISPATCH: dict[str, Callable[[str], dict]] = {
     "generate_quiz": generate_quiz,
     "generate_mindmap": generate_mindmap,
@@ -61,9 +64,19 @@ def build_tool_declarations() -> list[dict]:
 
 
 @asynccontextmanager
-async def open_live_session(client: genai.Client):
+async def open_live_session(client: genai.Client, voice_name: str = DEFAULT_VOICE):
+    if voice_name not in SUPPORTED_VOICES:
+        raise ValueError(f"Unsupported voice: {voice_name}")
+
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=voice_name,
+                )
+            )
+        ),
         system_instruction=TUTOR_SYSTEM_PROMPT,
         tools=[{"function_declarations": build_tool_declarations()}],
         # Transcribes Gemini's own spoken audio so the frontend can show a

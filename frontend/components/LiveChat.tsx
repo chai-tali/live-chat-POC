@@ -1,13 +1,22 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { connectLiveChat, type ToolResultEvent } from "@/lib/ws";
 import { floatTo16BitPCM, pcm16ToFloat32 } from "@/lib/audio";
 import ToolResultCard from "./ToolResultCard";
+import TutorAvatar from "./TutorAvatar";
 
-type Status = "idle" | "connecting" | "listening" | "speaking" | "error";
+type Status = "idle" | "connecting" | "listening" | "generating" | "speaking" | "error";
 
 type Message = { role: "user" | "assistant"; text: string };
+
+const INTRO_MESSAGE: Message = {
+  role: "assistant",
+  text: "Hi! I’m your tutor. Start the conversation and ask me anything you’d like to learn.",
+};
+
+const VOICES = ["Kore", "Puck", "Charon", "Aoede"] as const;
+type VoiceName = (typeof VOICES)[number];
 
 const WS_URL = process.env.NEXT_PUBLIC_LIVE_CHAT_WS_URL || "ws://localhost:8100/ws/live-chat";
 
@@ -15,6 +24,7 @@ const STATUS_COLORS: Record<Status, string> = {
   idle: "#9ca3af",
   connecting: "#f59e0b",
   listening: "#3b82f6",
+  generating: "#8b5cf6",
   speaking: "#10b981",
   error: "#ef4444",
 };
@@ -39,31 +49,79 @@ export default function LiveChat() {
   const [status, setStatus] = useState<Status>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toolResults, setToolResults] = useState<ToolResultEvent[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>([INTRO_MESSAGE]);
+  const [isMuted, setIsMuted] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState<VoiceName>("Kore");
   const [inProgressUserText, setInProgressUserText] = useState("");
   const [inProgressAssistantText, setInProgressAssistantText] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const isMutedRef = useRef(false);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const discardIncomingAudioRef = useRef(false);
 
   // Single persistent playback AudioContext, created lazily on first chunk,
   // instead of a new AudioContext per chunk (which overlaps audio and hits
   // Chrome's ~6-concurrent-context cap). Chunks are scheduled back-to-back
   // via nextStartTimeRef rather than started with no argument.
   const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
   const isSpeakingRef = useRef(false);
   const silentChunkCountRef = useRef(0);
 
-  // Guards against a spurious barge-in: the mic can pick up the tail of the
-  // assistant's own audio (even with echoCancellation) right as it finishes,
-  // which reads as the user starting a new utterance before the assistant
-  // is actually done. Turn detection is suppressed while the assistant is
-  // actively speaking, plus a short cooldown after playback truly ends.
+  // A short cooldown after playback ends prevents its audio tail from being
+  // mistaken for a new user utterance. While playback is active we use a
+  // higher speech threshold, allowing deliberate speech to barge in.
   const assistantSpeakingRef = useRef(false);
   const assistantCooldownUntilRef = useRef(0);
   const ASSISTANT_COOLDOWN_MS = 400;
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, inProgressUserText, inProgressAssistantText]);
+
+  const stopAssistantPlayback = useCallback(() => {
+    discardIncomingAudioRef.current = true;
+    scheduledSourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch {
+        // The source may already have ended.
+      }
+    });
+    scheduledSourcesRef.current = [];
+    assistantSpeakingRef.current = false;
+    const playbackCtx = playbackContextRef.current;
+    if (playbackCtx) nextStartTimeRef.current = playbackCtx.currentTime;
+    setStatus("listening");
+  }, []);
+
+  const interruptTutor = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "interrupt" }));
+    }
+    stopAssistantPlayback();
+  }, [stopAssistantPlayback]);
+
+  const toggleMute = useCallback(() => {
+    const nextMuted = !isMutedRef.current;
+    isMutedRef.current = nextMuted;
+    setIsMuted(nextMuted);
+    mediaStreamRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = !nextMuted;
+    });
+    if (nextMuted && isSpeakingRef.current) {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "activity_cancel" }));
+      }
+      isSpeakingRef.current = false;
+      silentChunkCountRef.current = 0;
+    }
+  }, []);
 
   const start = useCallback(async () => {
     setErrorMessage(null);
@@ -80,12 +138,17 @@ export default function LiveChat() {
       return;
     }
 
+    mediaStreamRef.current = stream;
+
     const audioContext = new AudioContext({ sampleRate: 16000 });
     audioContextRef.current = audioContext;
 
+    const separator = WS_URL.includes("?") ? "&" : "?";
+    const wsUrl = WS_URL + separator + "voice=" + encodeURIComponent(selectedVoice);
     const ws = connectLiveChat(
-      WS_URL,
+      wsUrl,
       (chunk) => {
+        if (discardIncomingAudioRef.current) return;
         const playbackCtx = (playbackContextRef.current ??= new AudioContext({
           sampleRate: 24000,
         }));
@@ -94,7 +157,15 @@ export default function LiveChat() {
         buffer.copyToChannel(floatData as Float32Array<ArrayBuffer>, 0);
         const source = playbackCtx.createBufferSource();
         source.buffer = buffer;
-        source.connect(playbackCtx.destination);
+        let analyser = playbackAnalyserRef.current;
+        if (!analyser) {
+          analyser = playbackCtx.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.45;
+          analyser.connect(playbackCtx.destination);
+          playbackAnalyserRef.current = analyser;
+        }
+        source.connect(analyser);
 
         const startAt = Math.max(playbackCtx.currentTime, nextStartTimeRef.current);
         source.start(startAt);
@@ -115,21 +186,7 @@ export default function LiveChat() {
         };
       },
       (event) => setToolResults((prev) => [...prev, event]),
-      () => {
-        // Barge-in: stop everything currently scheduled and reset the
-        // playback clock so new audio starts immediately.
-        scheduledSourcesRef.current.forEach((s) => {
-          try {
-            s.stop();
-          } catch {
-            // source may have already finished/been stopped; ignore.
-          }
-        });
-        scheduledSourcesRef.current = [];
-        const playbackCtx = playbackContextRef.current;
-        if (playbackCtx) nextStartTimeRef.current = playbackCtx.currentTime;
-        setStatus("listening");
-      },
+      stopAssistantPlayback,
       (event) => {
         const setInProgress = event.role === "user" ? setInProgressUserText : setInProgressAssistantText;
         if (event.finished) {
@@ -158,16 +215,21 @@ export default function LiveChat() {
     source.connect(processor);
     processor.connect(audioContext.destination);
     processor.onaudioprocess = (event) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
+      if (ws.readyState !== WebSocket.OPEN || isMutedRef.current) return;
       const input = event.inputBuffer.getChannelData(0);
 
-      const suppressTurnDetection =
-        assistantSpeakingRef.current || Date.now() < assistantCooldownUntilRef.current;
+      const assistantWasSpeaking = assistantSpeakingRef.current;
+      const suppressTurnDetection = Date.now() < assistantCooldownUntilRef.current;
+      const speechThreshold = assistantWasSpeaking ? 0.04 : SPEECH_RMS_THRESHOLD;
 
       const rms = computeRms(input);
-      if (!suppressTurnDetection && rms > SPEECH_RMS_THRESHOLD) {
+      if (!suppressTurnDetection && rms > speechThreshold) {
         silentChunkCountRef.current = 0;
         if (!isSpeakingRef.current) {
+          if (assistantWasSpeaking) {
+            ws.send(JSON.stringify({ type: "interrupt" }));
+            stopAssistantPlayback();
+          }
           isSpeakingRef.current = true;
           ws.send(JSON.stringify({ type: "activity_start" }));
         }
@@ -177,6 +239,8 @@ export default function LiveChat() {
           isSpeakingRef.current = false;
           silentChunkCountRef.current = 0;
           ws.send(JSON.stringify({ type: "activity_end" }));
+          discardIncomingAudioRef.current = false;
+          setStatus("generating");
         }
       }
 
@@ -187,18 +251,22 @@ export default function LiveChat() {
         ws.send(floatTo16BitPCM(input));
       }
     };
-  }, []);
+  }, [selectedVoice, stopAssistantPlayback]);
 
   return (
     <div
       style={{
-        maxWidth: 560,
+        maxWidth: 920,
         margin: "40px auto",
         padding: "0 16px",
         fontFamily: "sans-serif",
       }}
     >
       <h1 style={{ marginBottom: 4 }}>Live Chat POC</h1>
+
+      <div style={{ margin: "18px 0" }}>
+        <TutorAvatar analyserRef={playbackAnalyserRef} speaking={status === "speaking"} />
+      </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
         <span
@@ -210,7 +278,7 @@ export default function LiveChat() {
             background: STATUS_COLORS[status],
           }}
         />
-        <span style={{ color: "#374151" }}>{status}</span>
+        <span style={{ color: "#374151" }}>{isMuted ? "microphone muted" : status}</span>
       </div>
 
       {errorMessage && (
@@ -218,19 +286,33 @@ export default function LiveChat() {
       )}
 
       {status === "idle" && (
-        <button
-          onClick={start}
-          style={{
-            padding: "8px 16px",
-            borderRadius: 6,
-            border: "1px solid #d1d5db",
-            background: "#111827",
-            color: "white",
-            cursor: "pointer",
-          }}
-        >
-          Start conversation
-        </button>
+        <div style={{ display: "flex", alignItems: "end", gap: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: 6, color: "#374151", fontSize: 14 }}>
+            Tutor voice
+            <select
+              value={selectedVoice}
+              onChange={(event) => setSelectedVoice(event.target.value as VoiceName)}
+              style={{ padding: "8px 10px", borderRadius: 6, border: "1px solid #d1d5db", background: "white" }}
+            >
+              {VOICES.map((voice) => (
+                <option key={voice} value={voice}>{voice}</option>
+              ))}
+            </select>
+          </label>
+          <button
+            onClick={start}
+            style={{
+              padding: "8px 16px",
+              borderRadius: 6,
+              border: "1px solid #d1d5db",
+              background: "#111827",
+              color: "white",
+              cursor: "pointer",
+            }}
+          >
+            Start conversation
+          </button>
+        </div>
       )}
 
       {(messages.length > 0 || inProgressUserText || inProgressAssistantText) && (
@@ -240,8 +322,7 @@ export default function LiveChat() {
             display: "flex",
             flexDirection: "column",
             gap: 8,
-            maxHeight: 360,
-            overflowY: "auto",
+            paddingBottom: 96,
           }}
         >
           {messages.map((message, i) => (
@@ -254,6 +335,8 @@ export default function LiveChat() {
                 borderRadius: 10,
                 padding: "8px 12px",
                 color: "#111827",
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
               }}
             >
               {message.text}
@@ -268,6 +351,8 @@ export default function LiveChat() {
                 borderRadius: 10,
                 padding: "8px 12px",
                 color: "#6b7280",
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
               }}
             >
               {inProgressUserText}
@@ -282,10 +367,67 @@ export default function LiveChat() {
                 borderRadius: 10,
                 padding: "8px 12px",
                 color: "#6b7280",
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
               }}
             >
               {inProgressAssistantText}
             </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+      )}
+
+      {status !== "idle" && status !== "connecting" && status !== "error" && (
+        <div
+          style={{
+            position: "fixed",
+            left: "50%",
+            bottom: 24,
+            transform: "translateX(-50%)",
+            zIndex: 10,
+            display: "flex",
+            gap: 10,
+          }}
+        >
+          <button
+            type="button"
+            onClick={toggleMute}
+            aria-pressed={isMuted}
+            aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+            style={{
+              minWidth: 112,
+              padding: "12px 18px",
+              borderRadius: 999,
+              border: isMuted ? "1px solid #b91c1c" : "1px solid #374151",
+              background: isMuted ? "#dc2626" : "#111827",
+              color: "white",
+              fontSize: 15,
+              cursor: "pointer",
+              boxShadow: "0 8px 24px rgba(0, 0, 0, 0.2)",
+            }}
+          >
+            {isMuted ? "Unmute mic" : "Mute mic"}
+          </button>
+          {(status === "speaking" || status === "generating") && (
+            <button
+              type="button"
+              onClick={interruptTutor}
+              aria-label="Stop tutor response and listen"
+              style={{
+                minWidth: 128,
+                padding: "12px 18px",
+                borderRadius: 999,
+                border: "1px solid #d1d5db",
+                background: "white",
+                color: "#111827",
+                fontSize: 15,
+                cursor: "pointer",
+                boxShadow: "0 8px 24px rgba(0, 0, 0, 0.16)",
+              }}
+            >
+              Stop response
+            </button>
           )}
         </div>
       )}

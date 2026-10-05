@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 
-from app.gemini_live import open_live_session
-from app.relay import relay_browser_to_gemini, relay_gemini_to_browser
+from app.gemini_live import SUPPORTED_VOICES, open_live_session
+from app.relay import RelayState, relay_browser_to_gemini, relay_gemini_to_browser
 
 load_dotenv()
 logger = structlog.get_logger()
@@ -23,12 +23,16 @@ _client = genai.Client(api_key=_api_key)
 
 
 @app.websocket("/ws/live-chat")
-async def live_chat(websocket: WebSocket) -> None:
+async def live_chat(websocket: WebSocket, voice: str = "Kore") -> None:
     await websocket.accept()
+    if voice not in SUPPORTED_VOICES:
+        await websocket.close(code=1008, reason="Unsupported voice")
+        return
     try:
-        async with open_live_session(_client) as session:
-            to_gemini = asyncio.create_task(relay_browser_to_gemini(websocket, session))
-            to_browser = asyncio.create_task(relay_gemini_to_browser(websocket, session))
+        async with open_live_session(_client, voice) as session:
+            relay_state = RelayState()
+            to_gemini = asyncio.create_task(relay_browser_to_gemini(websocket, session, relay_state))
+            to_browser = asyncio.create_task(relay_gemini_to_browser(websocket, session, relay_state))
             done, pending = await asyncio.wait(
                 {to_gemini, to_browser}, return_when=asyncio.FIRST_EXCEPTION
             )
