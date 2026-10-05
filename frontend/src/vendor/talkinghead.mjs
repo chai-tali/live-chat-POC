@@ -798,7 +798,9 @@ class TalkingHead {
     this.isSpeaking = false;
     this.isListening = false;
 
-    // Setup Google text-to-speech
+    // Setup Google text-to-speech when configured. Kyros supplies its own
+    // streamed Gemini audio and drives morph targets directly, so a TTS
+    // endpoint is optional for this integration.
     if ( this.opt.ttsEndpoint ) {
       let audio = new Audio();
       if (audio.canPlayType("audio/ogg")) {
@@ -808,8 +810,6 @@ class TalkingHead {
       } else {
         throw new Error("There was no support for either OGG or MP3 audio.");
       }
-    } else {
-      throw new Error("You must provide some Google-compliant Text-To-Speech Endpoint.");
     }
 
 

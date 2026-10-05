@@ -42,7 +42,7 @@ export default function TutorAvatar({ analyserRef, speaking }: Props) {
         avatarRef.current = avatar;
 
         await avatar.showAvatar({
-          url: "/dialoglab/tutor-avatar.glb",
+          url: "/dialoglab/male-avatar1.glb",
           body: "F",
           avatarMood: "neutral",
           lipsyncLang: "en",

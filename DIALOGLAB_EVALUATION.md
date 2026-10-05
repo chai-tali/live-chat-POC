@@ -10,7 +10,8 @@ The POC in this repository connects DialogLab's TalkingHead renderer to the
 existing Gemini Live voice stream. The existing Kyros/Gemini path continues to
 own turn taking, tutor instructions, transcripts, tools, and interruption. A
 Web Audio analyser measures each outbound audio chunk and drives the avatar's
-mouth while the tutor speaks.
+mouth while the tutor speaks. The vendored renderer has one small compatibility
+patch that makes its Google TTS endpoint optional because Kyros supplies audio.
 
 ```text
 Student microphone
